@@ -76,10 +76,20 @@ class NMT(nn.Module):
         ###         https://pytorch.org/docs/stable/nn.html#torch.nn.Linear
         ###     Dropout Layer:
         ###         https://pytorch.org/docs/stable/nn.html#torch.nn.Dropout
-
-
-
-
+        self.encoder = nn.LSTM(input_size=embed_size, hidden_size=hidden_size, bias=True, bidirectional=True)
+        # 前一个 h/c 和当前 y
+        self.decoder = nn.LSTMCell(input_size=embed_size+hidden_size, hidden_size=hidden_size, bias=True)
+        # concat(h_1, h_m)
+        self.h_projection = nn.Linear(self.hidden_size*2, self.hidden_size, bias=False)
+        # concat(c_1, c_m)
+        self.c_projection = nn.Linear(self.hidden_size*2, self.hidden_size, bias=False)
+        # h_t dec
+        self.att_projection = nn.Linear(self.hidden_size*2, self.hidden_size, bias=False)
+        # a_t : h, h_t : 2 h
+        self.combined_output_projection = nn.Linear(self.hidden_size*3, self.hidden_size, bias=False)
+        # v_t
+        self.target_vocab_projection = nn.Linear(self.hidden_size, len(self.vocab.tgt), bias=False)
+        self.dropout = nn.Dropout(p=self.dropout_rate, inplace=False)
         ### END YOUR CODE
 
 
@@ -168,11 +178,14 @@ class NMT(nn.Module):
         ###         https://pytorch.org/docs/stable/torch.html#torch.cat
         ###     Tensor Permute:
         ###         https://pytorch.org/docs/stable/tensors.html#torch.Tensor.permute
-
-
-
-
-
+        X = self.model_embeddings.source(source_padded)
+        X_packed = pack_padded_sequence(X, torch.tensor(source_lengths))
+        enc_hiddens, (last_hidden, last_cell) = self.encoder(X_packed)
+        enc_hiddens, _ = pad_packed_sequence(enc_hiddens, batch_first=True)
+        # last_hidden 包含了正向和反向的 h, (2, b, h)
+        init_decoder_hidden = self.h_projection(torch.cat((last_hidden[0], last_hidden[1]), 1))
+        init_decoder_cell = self.c_projection(torch.cat((last_cell[0], last_cell[1]), 1))
+        dec_init_state = (init_decoder_hidden, init_decoder_cell)
         ### END YOUR CODE
 
         return enc_hiddens, dec_init_state
@@ -241,12 +254,18 @@ class NMT(nn.Module):
         ###         https://pytorch.org/docs/stable/torch.html#torch.cat
         ###     Tensor Stacking:
         ###         https://pytorch.org/docs/stable/torch.html#torch.stack
-
-
-
-
-
-
+        enc_hiddens_proj = self.att_projection(enc_hiddens)
+        Y = self.model_embeddings.target(target_padded)
+        Y = torch.split(Y, 1, dim=0)
+        for Y_t in Y:
+            # Y_t : (1, b, e)
+            Y_t = Y_t.squeeze()
+            # Y_t : (b, e)
+            Ybar_t = torch.cat((Y_t, o_prev), 1)
+            dec_state, o_t, e_t = self.step(Ybar_t, dec_state, enc_hiddens, enc_hiddens_proj, enc_masks)
+            combined_outputs.append(o_t)
+            o_prev = o_t
+        combined_outputs = torch.stack(combined_outputs, dim=0)
         ### END YOUR CODE
 
         return combined_outputs
@@ -303,8 +322,12 @@ class NMT(nn.Module):
         ###         https://pytorch.org/docs/stable/torch.html#torch.unsqueeze
         ###     Tensor Squeeze:
         ###         https://pytorch.org/docs/stable/torch.html#torch.squeeze
-
-
+        (dec_hidden, dec_cell) = self.decoder(Ybar_t, dec_state)
+        dec_state = (dec_hidden, dec_cell)
+        # enc_hiddens_proj: (b, src_len, h)
+        # dec_hidden: (b, h) -> (b, h, 1)
+        e_t = torch.bmm(enc_hiddens_proj, dec_hidden.unsqueeze(2)).squeeze(2)
+        # (b, src_len)
 
 
         ### END YOUR CODE
@@ -340,10 +363,13 @@ class NMT(nn.Module):
         ###         https://pytorch.org/docs/stable/torch.html#torch.cat
         ###     Tanh:
         ###         https://pytorch.org/docs/stable/torch.html#torch.tanh
-
-
-
-
+        alpha_t = F.softmax(e_t, dim=1)
+        # alpha_t : (b, src_len) -> (b, 1, src_len)
+        # enc_hiddens: (b, src_len, 2h)
+        a_t = torch.bmm(alpha_t.unsqueeze(1), enc_hiddens).squeeze(1)
+        U_t = torch.cat((a_t, dec_hidden), dim=1)
+        V_t = self.combined_output_projection(U_t)
+        O_t = self.dropout(torch.tanh(V_t))
 
         ### END YOUR CODE
 
@@ -384,16 +410,20 @@ class NMT(nn.Module):
         att_tm1 = torch.zeros(1, self.hidden_size, device=self.device)
 
         eos_id = self.vocab.tgt['</s>']
-
+        # 保存当前层的每个序列
         hypotheses = [['<s>']]
+        # 当前层每个序列的分数
         hyp_scores = torch.zeros(len(hypotheses), dtype=torch.float, device=self.device)
+        # 终止的序列
         completed_hypotheses = []
 
         t = 0
         while len(completed_hypotheses) < beam_size and t < max_decoding_time_step:
             t += 1
+            # 当前序列数量
             hyp_num = len(hypotheses)
-
+            # 对当前每一个词，都扩展一份enc,方便后续运算
+            # src_encodings : (1, src_len, h * 2)->(hyp_num, src_len, h * 2)
             exp_src_encodings = src_encodings.expand(hyp_num,
                                                      src_encodings.size(1),
                                                      src_encodings.size(2))
@@ -401,7 +431,7 @@ class NMT(nn.Module):
             exp_src_encodings_att_linear = src_encodings_att_linear.expand(hyp_num,
                                                                            src_encodings_att_linear.size(1),
                                                                            src_encodings_att_linear.size(2))
-
+            # 每个序列的最后一个词合起来进行预测
             y_tm1 = torch.tensor([self.vocab.tgt[hyp[-1]] for hyp in hypotheses], dtype=torch.long, device=self.device)
             y_t_embed = self.model_embeddings.target(y_tm1)
 
@@ -411,13 +441,18 @@ class NMT(nn.Module):
                                                       exp_src_encodings, exp_src_encodings_att_linear, enc_masks=None)
 
             # log probabilities over target words
+            # 得到每个词概率
             log_p_t = F.log_softmax(self.target_vocab_projection(att_t), dim=-1)
 
+            # 待搜索的序列数量
             live_hyp_num = beam_size - len(completed_hypotheses)
+            # 对于每一个序列,计算分数
             contiuating_hyp_scores = (hyp_scores.unsqueeze(1).expand_as(log_p_t) + log_p_t).view(-1)
+            # 找到 k 个概率最高的序列
             top_cand_hyp_scores, top_cand_hyp_pos = torch.topk(contiuating_hyp_scores, k=live_hyp_num)
-
+            # 序列的索引
             prev_hyp_ids = torch.div(top_cand_hyp_pos, len(self.vocab.tgt), rounding_mode='floor')
+            # 当前词
             hyp_word_ids = top_cand_hyp_pos % len(self.vocab.tgt)
 
             new_hypotheses = []
@@ -431,17 +466,18 @@ class NMT(nn.Module):
 
                 hyp_word = self.vocab.tgt.id2word[hyp_word_id]
                 new_hyp_sent = hypotheses[prev_hyp_id] + [hyp_word]
+                # 当前序列搜索完成, 加入completed_hypotheses中
                 if hyp_word == '</s>':
                     completed_hypotheses.append(Hypothesis(value=new_hyp_sent[1:-1],
                                                            score=cand_new_hyp_score))
                 else:
                     new_hypotheses.append(new_hyp_sent)
-                    live_hyp_ids.append(prev_hyp_id)
+                    live_hyp_ids.append(prev_hyp_id) # 在序列中添加这个词
                     new_hyp_scores.append(cand_new_hyp_score)
 
             if len(completed_hypotheses) == beam_size:
                 break
-
+            # 更新 state 和 o_prev
             live_hyp_ids = torch.tensor(live_hyp_ids, dtype=torch.long, device=self.device)
             h_tm1 = (h_t[live_hyp_ids], cell_t[live_hyp_ids])
             att_tm1 = att_t[live_hyp_ids]
